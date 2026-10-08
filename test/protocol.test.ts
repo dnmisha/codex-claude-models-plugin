@@ -142,3 +142,58 @@ test('SDK turn exhaustion is reported without suggesting credential failure', as
   })(), {close() {}, async accountInfo() {return {apiProvider: 'firstParty', subscriptionType: 'team'};}})) as unknown as typeof query;
   await assert.rejects(sdkRunner('/tmp', [model], fake)(request, new AbortController().signal), (error: any) => error.code === 'sdk_turn_limit' && !error.message.includes('Check Claude login'));
 });
+
+
+test('SDK native tool attempts are handed to Codex before SDK execution', async () => {
+  let closed = false, advanced = false;
+  const fake = (() => Object.assign((async function* () {
+    yield {type: 'assistant', message: {content: [{type: 'tool_use', id: 'native', name: 'read_file', input: {path: 'fixture.txt'}}]}} as SDKMessage;
+    advanced = true;
+    throw new Error('SDK executor must never receive this call');
+  })(), {close() {closed = true;}, async accountInfo() {return {apiProvider: 'firstParty', subscriptionType: 'team'};}})) as unknown as typeof query;
+  const model = {id: request.model, sdkModel: 'haiku', displayName: 'Haiku', description: '', efforts: []};
+  const result = await sdkRunner('/tmp', [model], fake)(request, new AbortController().signal);
+  assert.deepEqual(result.decision.calls, [{kind: 'function', name: 'functions.read_file', input: '{"path":"fixture.txt"}'}]);
+  assert.equal(closed, true);
+  assert.equal(advanced, false);
+});
+
+test('SDK native calls cannot bypass the advertised-tool allowlist', async () => {
+  const fake = (() => Object.assign((async function* () {
+    yield {type: 'assistant', message: {content: [{type: 'tool_use', id: 'native', name: 'Bash', input: {command: 'anything'}}]}} as SDKMessage;
+  })(), {close() {}, async accountInfo() {return {apiProvider: 'firstParty', subscriptionType: 'team'};}})) as unknown as typeof query;
+  const model = {id: request.model, sdkModel: 'haiku', displayName: 'Haiku', description: '', efforts: []};
+  await assert.rejects(sdkRunner('/tmp', [model], fake)(request, new AbortController().signal), (error: any) => error.code === 'unknown_tool');
+});
+
+
+test('internal SDK turns do not multiply the context size reported to Codex', async () => {
+  const fake = (() => Object.assign((async function* () {
+    yield {type: 'assistant', message: {content: [], usage: {input_tokens: 10, cache_read_input_tokens: 30, cache_creation_input_tokens: 20, output_tokens: 5}}} as unknown as SDKMessage;
+    yield {type: 'result', subtype: 'success', is_error: false, structured_output: {text: 'done', calls: []}, modelUsage: {model: {inputTokens: 100, cacheReadInputTokens: 300, cacheCreationInputTokens: 200, outputTokens: 50}}} as unknown as SDKMessage;
+  })(), {close() {}, async accountInfo() {return {apiProvider: 'firstParty', subscriptionType: 'team'};}})) as unknown as typeof query;
+  const model = {id: request.model, sdkModel: 'haiku', displayName: 'Haiku', description: '', efforts: []};
+  const result = await sdkRunner('/tmp', [model], fake)(request, new AbortController().signal);
+  assert.equal(result.usage.input_tokens, 60);
+  assert.equal(result.usage.input_tokens_details.cached_tokens, 30);
+  assert.equal(result.usage.output_tokens, 50);
+  assert.equal(result.usage.total_tokens, 110);
+});
+
+
+test('native custom payloads and namespace ambiguity preserve dispatch boundaries', async () => {
+  const model = {id: request.model, sdkModel: 'haiku', displayName: 'Haiku', description: '', efforts: []};
+  const run = (name: string, input: unknown, req = request) => {
+    const fake = (() => Object.assign((async function* () {
+      yield {type: 'assistant', message: {content: [{type: 'tool_use', id: 'native', name, input}]}} as unknown as SDKMessage;
+    })(), {close() {}, async accountInfo() {return {apiProvider: 'firstParty', subscriptionType: 'team'};}})) as unknown as typeof query;
+    return sdkRunner('/tmp', [model], fake)(req, new AbortController().signal);
+  };
+  assert.deepEqual((await run('functions.apply_patch', {input: 'literal patch'})).decision.calls,
+    [{kind: 'custom', name: 'functions.apply_patch', input: 'literal patch'}]);
+  await assert.rejects(run('apply_patch', {patch: 'unrecognized wrapper'}), (error: any) => error.code === 'invalid_arguments');
+  await assert.rejects(run('read_file', {}, {...request, tools: [...request.tools,
+    {type: 'namespace', name: 'other', tools: [{type: 'function', name: 'read_file', parameters: {type: 'object'}}]}]}),
+    (error: any) => error.code === 'unknown_tool');
+  await assert.rejects(run('read_file', {}, {...request, tool_choice: 'none'}), (error: any) => error.code === 'tool_choice');
+});

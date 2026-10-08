@@ -63,6 +63,7 @@ export function sdkRunner(cwd: string, models: ClaudeModel[], queryImpl: typeof 
     let release!: () => void;
     const authenticated = new Promise<void>(resolve => {release = resolve;});
     let permitted = false;
+    let contextUsage: Usage | undefined;
     try {
       session = queryImpl({prompt: (async function* (): AsyncGenerator<SDKUserMessage> {
         await authenticated;
@@ -75,6 +76,34 @@ export function sdkRunner(cwd: string, models: ClaudeModel[], queryImpl: typeof 
       }
       permitted = true; release();
       for await (const message of session) {
+        if (message.type === 'assistant' && message.message?.usage) {
+          const tokens = message.message.usage;
+          const cached = tokens.cache_read_input_tokens ?? 0;
+          const input = tokens.input_tokens + cached + (tokens.cache_creation_input_tokens ?? 0);
+          contextUsage = {input_tokens: input, input_tokens_details: {cached_tokens: cached}, output_tokens: tokens.output_tokens,
+            output_tokens_details: {reasoning_tokens: 0}, total_tokens: input + tokens.output_tokens};
+        }
+        if (message.type === 'assistant' && message.message?.content) {
+          const nativeCalls = message.message.content.filter(part => part.type === 'tool_use' && part.name !== 'StructuredOutput');
+          if (nativeCalls.length) {
+            // The SDK executor remains disabled. Yield advertised calls to Codex
+            // before the SDK produces misleading 'No such tool' feedback.
+            const calls = nativeCalls.map(part => {
+              if (part.type !== 'tool_use') throw new BridgeError(502, 'invalid_decision', 'Invalid SDK tool request.');
+              const exact = prepared.tools.filter(tool => tool.key === part.name);
+              const candidates = exact.length ? exact : prepared.tools.filter(tool => tool.name === part.name);
+              if (candidates.length !== 1) throw new BridgeError(502, 'unknown_tool', 'Claude requested an unknown or ambiguous SDK tool.');
+              const tool = candidates[0]!;
+              const input = tool.kind === 'function' ? JSON.stringify(part.input)
+                : typeof part.input === 'string' ? part.input
+                : part.input && typeof part.input === 'object' && 'input' in part.input && typeof part.input.input === 'string' ? part.input.input : null;
+              if (input === null) throw new BridgeError(502, 'invalid_arguments', 'Claude returned an invalid custom tool payload.');
+              return {kind: tool.kind, name: tool.key, input};
+            });
+            abortController.abort();
+            return {decision: validateDecision({text: '', calls}, request), usage: contextUsage ?? usageFromModels({})};
+          }
+        }
         if (message.type !== 'result') continue;
         if (message.subtype === 'error_max_turns') {
           throw new BridgeError(502, 'sdk_turn_limit', 'Claude reached the internal structured-decision turn limit before producing a validated result. Retry a smaller step; the SDK did not report a login or network failure.');
@@ -82,7 +111,15 @@ export function sdkRunner(cwd: string, models: ClaudeModel[], queryImpl: typeof 
         if (message.subtype !== 'success' || message.is_error) {
           throw new BridgeError(502, 'claude_failed', `Claude SDK did not complete successfully (${message.subtype}). Check Claude login, usage limits and model access.`);
         }
-        return {decision: validateDecision(message.structured_output, request), usage: usageFromModels(message.modelUsage)};
+        const usage = usageFromModels(message.modelUsage);
+        // SDK modelUsage sums input across internal turns. Codex uses input
+        // usage to size the context, so report the latest actual context instead.
+        if (contextUsage) {
+          usage.input_tokens = contextUsage.input_tokens;
+          usage.input_tokens_details = contextUsage.input_tokens_details;
+          usage.total_tokens = usage.input_tokens + usage.output_tokens;
+        }
+        return {decision: validateDecision(message.structured_output, request), usage};
       }
       throw new BridgeError(502, 'incomplete_sdk', 'Claude SDK ended without a result.');
     } finally {release(); signal.removeEventListener('abort', abort); session?.close();}

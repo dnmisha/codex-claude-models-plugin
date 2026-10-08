@@ -73,3 +73,14 @@ A GUI task reported `error_max_turns` with the adapter's fixed three-turn SDK bu
 Validation: the new four-turn structured-result regression failed before the change and passed afterward; all 38 tests, TypeScript and build pass. The working router was updated with backup bundles retained. A real Sonnet High task on desktop backend 0.162.0-alpha.2 executed a Codex command to read a synthetic fixture and returned its exact content. An earlier live attempt completed with a tool-unavailable answer; model/tool-use reliability is not guaranteed by the increased budget.
 
 The desktop launcher uses a separate OS session via subprocess start_new_session=True to avoid sharing the Terminal controlling TTY. Session isolation was verified with a harmless child process; the next actual GUI launch is still a user action. The current GUI and app-server were confirmed to contain CODEX_CA_CERTIFICATE.
+
+
+## October 8 follow-up: SDK tool attempts and context usage
+
+The supplied desktop task executed one real Codex command, compacted context, and then claimed several unavailable tools without corresponding outer tool-call records. A synthetic live probe reproduced an SDK-native `write_stdin` attempt receiving `No such tool available`, while the outer Codex tool inventory and dispatch remained valid.
+
+The runner now intercepts SDK assistant tool-use blocks, accepts only exact advertised identities or unambiguous short names, validates tool choice/payload, and yields the request to Codex. SDK built-in tools remain disabled; unadvertised or ambiguous names fail closed. The SDK session is aborted and closed before advancing its executor loop. Custom payloads are preserved only as raw strings or the explicit `input` wrapper.
+
+SDK modelUsage aggregates input across internal turns; this inflated Codex context accounting. Responses now use the latest assistant context input/cache counts, while retaining aggregate output usage for structured-result steps. Intercepted native calls report their assistant usage.
+
+Validation: TypeScript, build and 42 unit/integration tests; deterministic current desktop consumer tool round trip; live Sonnet multi-step synthetic read using exec_command, write_stdin and another exec_command, then exact fixture answer. The native-attempt branch has deterministic allowlist, custom, ambiguous-name and tool-choice coverage; live model behavior does not trigger that branch on every run. Opt-in reproduction: CODEX_BIN=<desktop codex path> npx tsx scripts/sdk-tool-smoke.ts (uses Claude subscription and temporary files). No private project audit was run.
