@@ -1,3 +1,4 @@
+import { ensureIdentity, tlsOptions, identityPaths } from '../src/transport.js';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
@@ -18,7 +19,8 @@ await fs.mkdir(root, {recursive: true});
 await fs.writeFile(path.join(root, 'fixture.txt'), 'CODEX_TOOL_ROUNDTRIP_429731\n');
 let modelCalls = 0;
 let observedToolResult = false;
-const server = bridgeServer({token: 'test-token', run: async request => {
+await ensureIdentity(home.root);
+const server = bridgeServer({tls: await tlsOptions(home.root), token: 'test-token', run: async request => {
   modelCalls++;
   const output = Array.isArray(request.input) ? request.input.filter(i => i.type === 'function_call_output') : [];
   if (JSON.stringify(output).includes('CODEX_TOOL_ROUNDTRIP_429731')) {
@@ -33,7 +35,7 @@ const server = bridgeServer({token: 'test-token', run: async request => {
 server.listen(0, '127.0.0.1'); await once(server, 'listening');
 const children: ReturnType<typeof spawn>[] = [];
 function child(args: string[]) {
-  const proc = spawn(process.env.CODEX_BIN ?? 'codex', args, {cwd: root, env: {...process.env, CODEX_HOME: home.home}, stdio: ['pipe', 'pipe', 'pipe']});
+  const proc = spawn(process.env.CODEX_BIN ?? 'codex', args, {cwd: root, env: {...process.env, CODEX_HOME: home.home, CODEX_CA_CERTIFICATE: identityPaths(home.root).cert}, stdio: ['pipe', 'pipe', 'pipe']});
   children.push(proc); return proc;
 }
 

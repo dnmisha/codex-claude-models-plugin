@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage } from 'node:http';
+import { createServer as createSecureServer, type ServerOptions as TLSOptions } from 'node:https';
 import { timingSafeEqual } from 'node:crypto';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
@@ -8,6 +9,8 @@ import { ROUTER_TOKEN_HEADER, forwardedResponseHeaders, type ForwardOpenAI } fro
 import { VERSION } from './version.js';
 
 export interface ServerOptions {
+  tls?: TLSOptions; onShutdown?: () => void;
+  local?: {models: ReadonlySet<string>; forward: ForwardOpenAI; idleTimeoutMs?: number};
   token: string; run: RunStep; timeoutMs?: number; maxBytes?: number; concurrency?: number;
   openai?: {models: ReadonlySet<string>; forward: ForwardOpenAI; idleTimeoutMs?: number};
 }
@@ -31,7 +34,7 @@ async function body(request: IncomingMessage, maxBytes: number) {
 
 export function bridgeServer(options: ServerOptions) {
   let active = 0;
-  return createServer(async (req, res) => {
+  const handler = async (req: IncomingMessage, res: import('node:http').ServerResponse) => {
     let timer: ReturnType<typeof setTimeout> | undefined;
     let heartbeat: ReturnType<typeof setInterval> | undefined;
     let acquired = false;
@@ -56,6 +59,11 @@ export function bridgeServer(options: ServerOptions) {
         res.writeHead(200, {'content-type': 'application/json'}).end(JSON.stringify({service: 'codex-claude-models', version: VERSION, pid: process.pid}));
         return;
       }
+      if (req.method === 'POST' && req.url === '/shutdown' && options.onShutdown) {
+        res.writeHead(200, {'content-type': 'application/json'}).end('{"stopping":true}');
+        res.once('finish', options.onShutdown);
+        return;
+      }
       if (req.method !== 'POST' || !['/v1/responses', '/v1/responses/compact'].includes(req.url ?? '')) throw new BridgeError(404, 'not_found', 'Endpoint not found.');
       if (req.headers['content-encoding'] && req.headers['content-encoding'] !== 'identity') throw new BridgeError(415, 'content_encoding', 'The router expects uncompressed JSON requests.');
       if (active >= (options.concurrency ?? 6)) throw new BridgeError(429, 'busy', 'Claude bridge concurrency limit reached.');
@@ -63,14 +71,16 @@ export function bridgeServer(options: ServerOptions) {
       const payload = await body(req, options.maxBytes ?? 8 * 1024 * 1024);
       const model = payload.json && typeof payload.json === 'object' && 'model' in payload.json ? payload.json.model : undefined;
       if (typeof model !== 'string') throw new BridgeError(400, 'invalid_request', 'A model is required.');
-      if (options.openai?.models.has(model)) {
-        if (!routerAuth || legacyAuth) throw new BridgeError(401, 'chatgpt_login_required', 'GPT requests require router authentication and a separate Codex ChatGPT credential.');
+      const local = options.local?.models.has(model);
+      const upstreamRoute = local ? options.local : options.openai?.models.has(model) ? options.openai : undefined;
+      if (upstreamRoute) {
+        if (!routerAuth || (!local && legacyAuth)) throw new BridgeError(401, 'chatgpt_login_required', 'GPT requests require router authentication and a separate Codex ChatGPT credential.');
         forwarding = true;
-        timer = setTimeout(() => controller.abort(), options.openai.idleTimeoutMs ?? 300000);
-        const upstream = await options.openai.forward({path: req.url!, headers: req.headers, body: payload.bytes, signal: controller.signal});
+        timer = setTimeout(() => controller.abort(), upstreamRoute.idleTimeoutMs ?? 300000);
+        const upstream = await upstreamRoute.forward({path: req.url!, headers: req.headers, body: payload.bytes, signal: controller.signal});
         res.writeHead(upstream.status, forwardedResponseHeaders(upstream.headers));
         if (!upstream.body) {res.end(); return;}
-        const idle = options.openai.idleTimeoutMs ?? 300000;
+        const idle = upstreamRoute.idleTimeoutMs ?? 300000;
         await pipeline(Readable.fromWeb(upstream.body as import('node:stream/web').ReadableStream), async function* (source) {
           for await (const chunk of source) {
             clearTimeout(timer); timer = setTimeout(() => controller.abort(), idle);
@@ -109,5 +119,6 @@ export function bridgeServer(options: ServerOptions) {
         else res.writeHead(failure.status, {'content-type': 'application/json'}).end(JSON.stringify({error: details}));
       }
     } finally {if (acquired) active--; clearTimeout(timer); clearInterval(heartbeat);}
-  });
+  };
+  return options.tls ? createSecureServer(options.tls, handler) : createServer(handler);
 }

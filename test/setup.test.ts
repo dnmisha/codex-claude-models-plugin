@@ -108,3 +108,22 @@ test('switching provider modes releases ownership of settings no longer changed 
   assert.equal(config.web_search, 'live');
   assert.equal(config.features, undefined);
 });
+
+test('Ollama routing survives installation and deactivation without classifying its models as GPT', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-ollama-config-'));
+  t.after(() => fs.rm(root, {recursive: true, force: true}));
+  const p = locations(root);
+  const original = {model: 'ollama-fixture', openai_base_url: 'http://127.0.0.1:11434/api/codex/v1', model_catalog_json: '/fixture/catalog.json'};
+  await fs.mkdir(p.root, {recursive: true}); await fs.writeFile(p.token, 'inert-local-token');
+  await fs.writeFile(p.config, TOML.stringify(original));
+  await fs.writeFile(path.join(root, 'ollama-launch-codex-routing.json'), JSON.stringify({models: [{slug: 'ollama-fixture'}]}));
+  const state = await installConfig(p, models, 47842, {models: [{slug: 'gpt-fixture'}, {slug: 'ollama-fixture'}]});
+  assert.deepEqual(state.openaiModels, ['gpt-fixture']);
+  assert.deepEqual(state.localRoute, {baseURL: original.openai_base_url, models: ['ollama-fixture']});
+  assert.match(state.provider.base_url, /^https:/);
+  assert.match(state.routerProvider!.base_url, /^https:/);
+  await activateRouter(p);
+  assert.equal((TOML.parse(await fs.readFile(p.config, 'utf8')) as any).model, 'ollama-fixture');
+  await deactivate(p); await uninstallConfig(p);
+  assert.deepEqual(TOML.parse(await fs.readFile(p.config, 'utf8')), original);
+});

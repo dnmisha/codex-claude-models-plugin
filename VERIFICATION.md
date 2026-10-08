@@ -1,5 +1,24 @@
 # Verification record
 
+## October 8, 2026: authenticated local transport
+
+This branch replaces the bridge's HTTP provider/control routes with per-install verified HTTPS, removes server-PID signaling, preserves explicit existing Ollama routes without forwarding ChatGPT credentials, and updates compatible transitive dependency locks.
+
+Current evidence on macOS:
+
+- `npm run check`: strict TypeScript, 36 behavioral tests and plugin build.
+- `npm run test:codex`: standalone Codex 0.154.0 and desktop bundled backend 0.162.0-alpha.2 consume the HTTPS provider with `CODEX_CA_CERTIFICATE` in isolated homes. Native tool roundtrip, GPT → Claude → Ollama → GPT switching, startup hook execution/deactivation pass with deterministic providers and inert credentials.
+- The real Codex consumers reject a replacement server with an unrelated certificate before any HTTP request reaches it. The test interrupts Codex after the first rejected TLS handshake because its core may retry TLS errors independently of provider retry configuration.
+- Control tests reject plaintext/untrusted-TLS listeners, malformed PIDs and redirects; shutdown requires authentication. A legacy occupied port is rejected before token/state/config changes, with the complete prior installation preserved.
+- Root and runtime production-dependency audits report zero advisory findings at verification time. This is not an audit of dependency internals.
+- Independent read-only security review found a migration rollback mismatch; port preflight and retaining a matching secure runtime after committed configuration address it. No other concrete bypass was identified in that review.
+- An isolated bundled installation discovered models and started/stopped the HTTPS bridge. Live Claude inference was blocked by subscription authentication; it is **not** a passing live-account test. No live GPT/Ollama inference or desktop GUI trust/restart test is claimed.
+
+Desktop backend testing is an isolated process test. The running GUI still needs its own certificate-trust setting at startup. Do not infer that it inherits a terminal export. Some local standalone app-server starts exceeded the original 15-second model-list deadline; the final full consumers passed without changing that deadline. This intermittent startup behavior remains a limitation.
+
+The September record below describes the original upstream release; its live-account results are historical, not new evidence for this branch.
+
+
 Verification date: September 14, 2026. Local platform: macOS arm64. Claude Agent SDK: 0.3.270. Codex CLI: 0.154.0. Desktop bundled backend: 0.154.0-alpha.6.2.
 
 ## v0.2 combined picker

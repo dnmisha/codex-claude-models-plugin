@@ -7,6 +7,8 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import TOML from '@iarna/toml';
 import { codexCatalog, combinedCatalog, openaiCatalogSchema, type OpenAICatalog, type ClaudeModel } from './catalog.js';
+import { assertPortAvailable, controlRequest, ensureIdentity, identityPaths } from './transport.js';
+import { localBaseURL } from './local.js';
 import { VERSION } from './version.js';
 import { withCodexRpc } from './codex-rpc.js';
 
@@ -22,6 +24,7 @@ interface State {
   routerProvider?: Config;
   openaiModels?: string[];
   openaiSource?: string;
+  localRoute?: {baseURL: string; models: string[]};
   startHook?: Config;
   hookTrust?: {key: string; value: Config; previous: Config | null};
 }
@@ -86,12 +89,12 @@ export async function withLock<T>(p: Paths, action: () => Promise<T>) {
 }
 
 function provider(p: Paths, port: number) {
-  return {name: 'Claude Agent SDK', base_url: `http://127.0.0.1:${port}/v1`, wire_api: 'responses',
+  return {name: 'Claude Agent SDK', base_url: `https://127.0.0.1:${port}/v1`, wire_api: 'responses',
     requires_openai_auth: false, supports_websockets: false, request_max_retries: 0, stream_max_retries: 0,
     auth: {command: process.execPath, args: [path.join(p.root, 'setup.mjs'), 'token', '--codex-home', p.home], timeout_ms: 15000, refresh_interval_ms: 60000}};
 }
 function routerProvider(port: number, token: string) {
-  return {name: 'Codex + Claude Router', base_url: `http://127.0.0.1:${port}/v1`, wire_api: 'responses',
+  return {name: 'Codex + Claude Router', base_url: `https://127.0.0.1:${port}/v1`, wire_api: 'responses',
     requires_openai_auth: true, supports_websockets: false, request_max_retries: 0, stream_max_retries: 0,
     http_headers: {'X-Codex-Router-Token': token}};
 }
@@ -167,10 +170,21 @@ export async function installConfig(p: Paths, models: ClaudeModel[], port: numbe
   const definition = provider(p, port);
   const state: State = {...previous, version: VERSION, port, models, provider: definition, files};
   if (openai) {
+    // Preserve Ollama's explicit per-model routing rather than treating every
+    // non-Claude catalog entry as a first-party GPT model.
+    const baseURL = config.openai_base_url;
+    const routing = await readText(path.join(p.home, 'ollama-launch-codex-routing.json'));
+    if (typeof baseURL === 'string' && routing) {
+      localBaseURL(baseURL);
+      const parsed = JSON.parse(routing) as {models?: {slug?: unknown}[]};
+      if (!Array.isArray(parsed.models) || parsed.models.some(m => typeof m.slug !== 'string')) throw new Error('Invalid Ollama model routing file.');
+      const listed = new Set(openai.models.map(m => m.slug));
+      state.localRoute = {baseURL, models: parsed.models.map(m => String(m.slug)).filter(slug => listed.has(slug))};
+    }
     const token = (await readText(p.token)).trim();
     if (!token) throw new Error('Missing local router token. Run the full install command.');
     state.routerProvider = routerProvider(port, token);
-    state.openaiModels = openai.models.filter(m => !m.slug.startsWith('claude-sdk-')).map(m => m.slug);
+    state.openaiModels = openai.models.filter(m => !m.slug.startsWith('claude-sdk-') && !state.localRoute?.models.includes(m.slug)).map(m => m.slug);
     state.openaiSource = openaiSource;
     state.startHook = startupHook(p);
     if (previous?.startHook && config.hooks?.SessionStart?.some((entry: unknown) => same(entry, previous.startHook))) {
@@ -188,7 +202,7 @@ export async function installConfig(p: Paths, models: ClaudeModel[], port: numbe
   return state;
 }
 
-function knownModel(state: State, model: unknown) {return state.models.some(m => m.id === model) || state.openaiModels?.includes(String(model));}
+function knownModel(state: State, model: unknown) {return state.models.some(m => m.id === model) || state.openaiModels?.includes(String(model)) || state.localRoute?.models.includes(String(model));}
 
 async function select(p: Paths, state: State, selected: Record<string, unknown>, enableStartup = false) {
   const {source, config} = await readConfig(p);
@@ -221,9 +235,9 @@ export async function activate(p: Paths, modelId?: string) {
 
 export async function activateRouter(p: Paths, modelId?: string) {
   const state = await readState(p);
-  if (!state.routerProvider || !state.openaiModels?.length) throw new Error('The combined catalog is not installed. Run install first.');
+  if (!state.routerProvider || !(state.openaiModels?.length || state.localRoute?.models.length)) throw new Error('The combined catalog is not installed. Run install first.');
   const {config} = await readConfig(p);
-  const chosen = modelId ?? config.model ?? state.openaiModels[0];
+  const chosen = modelId ?? config.model ?? state.openaiModels?.[0] ?? state.localRoute?.models[0];
   if (!knownModel(state, chosen)) throw new Error(`Model ${String(chosen)} is not in the combined catalog. Pass --model with a listed model.`);
   await select(p, state, {model: chosen, model_provider: ROUTER, model_catalog_json: p.combined, 'features.hooks': true}, true);
 }
@@ -294,10 +308,11 @@ async function health(p: Paths, state: State) {
   const token = (await readText(p.token)).trim();
   if (!token) return null;
   try {
-    const response = await fetch(`http://127.0.0.1:${state.port}/health`, {headers: {Authorization: `Bearer ${token}`}, signal: AbortSignal.timeout(1000)});
-    if (!response.ok) return null;
-    const data = await response.json() as {service: string; version: string; pid: number};
-    return data.service === 'codex-claude-models' && Number.isInteger(data.pid) ? data : null;
+    const response = await controlRequest(p.root, state.port, token, '/health');
+    if (response.status !== 200) return null;
+    const data = JSON.parse(response.body) as {service: string; version: string; pid: number};
+    return data.service === 'codex-claude-models' && typeof data.version === 'string'
+      && Number.isSafeInteger(data.pid) && data.pid > 0 ? data : null;
   } catch {return null;}
 }
 
@@ -305,7 +320,9 @@ export async function stop(p: Paths) {
   const state = await readState(p);
   const live = await health(p, state);
   if (live) {
-    process.kill(live.pid, 'SIGTERM');
+    const token = (await readText(p.token)).trim();
+    const response = await controlRequest(p.root, state.port, token, '/shutdown');
+    if (response.status !== 200) throw new Error('Bridge refused authenticated shutdown.');
     for (let n = 0; n < 30; n++) {if (!await health(p, state)) return; await new Promise(resolve => setTimeout(resolve, 100));}
     throw new Error('Bridge did not stop; configuration has been preserved.');
   }
@@ -334,12 +351,15 @@ export async function ensure(p: Paths) {
 
 export async function install(p: Paths, port = 47832) {
   if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('Port must be an integer between 1024 and 65535.');
+  const existingState = await readText(p.state) ? await readState(p) : undefined;
+  if (!existingState || existingState.port !== port || existingState.provider.base_url?.startsWith('http:'))
+    await assertPortAvailable(port);
   const bundleDir = path.dirname(fileURLToPath(import.meta.url));
   const pluginRoot = path.resolve(bundleDir, '..');
   await fs.mkdir(path.join(p.root, 'sdk-cwd'), {recursive: true, mode: 0o700});
   const staging = await fs.mkdtemp(path.join(p.root, 'runtime-stage-'));
   const backup = `${p.runtime}.backup-${process.pid}-${Date.now()}`;
-  let swapped = false, backedUp = false;
+  let swapped = false, backedUp = false, configInstalled = false;
   try {
     for (const file of ['package.json', 'package-lock.json']) await fs.copyFile(path.join(pluginRoot, 'runtime', file), path.join(staging, file));
     await exec('npm', ['ci', '--omit=dev', '--no-audit', '--no-fund', '--ignore-scripts'], {cwd: staging, timeout: 180000, maxBuffer: 4 * 1024 * 1024});
@@ -348,23 +368,32 @@ export async function install(p: Paths, port = 47832) {
     const metadata = JSON.parse(result.stdout) as {authenticated: boolean; models: ClaudeModel[]};
     if (!metadata.authenticated) throw new Error('No Claude subscription login. Run claude auth login, then retry install.');
     const {catalog, source} = await readOpenAICatalog(p);
-    if (!await readText(p.token)) await writePrivate(p.token, `${randomBytes(32).toString('hex')}\n`);
-    if (await readText(p.state)) await stop(p);
+    const previous = await readText(p.state) ? await readState(p) : undefined;
+    if (previous) await stop(p);
+    await assertPortAvailable(port);
+    await ensureIdentity(p.root);
+    // A legacy plaintext listener may have disclosed its token. Never query or signal it.
+    if (!await readText(p.token) || previous?.provider.base_url?.startsWith('http:'))
+      await writePrivate(p.token, `${randomBytes(32).toString('hex')}\n`);
     try {await fs.rename(p.runtime, backup); backedUp = true;}
     catch (error) {if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;}
     await fs.rename(staging, p.runtime); swapped = true;
     await fs.copyFile(path.join(bundleDir, 'setup.mjs'), path.join(p.root, 'setup.mjs'));
     const state = await installConfig(p, metadata.models, port, catalog, source);
+    configInstalled = true;
     if (state.selected?.model_provider === ROUTER) await trustRouterStartup(p);
     await ensure(p);
     if (backedUp) await fs.rm(backup, {recursive: true}).catch(() => {});
     return metadata.models;
   } catch (error) {
-    if (backedUp) {
+    // Once configuration commits, its runtime must stay installed even if
+    // startup fails (for example, another process wins the port-binding race).
+    if (backedUp && !configInstalled) {
       if (swapped) await fs.rm(p.runtime, {recursive: true, force: true});
       await fs.rename(backup, p.runtime);
       if (await readText(p.state)) await ensure(p).catch(() => {});
     }
+    if (configInstalled) throw new Error(`Configuration and HTTPS runtime are installed, but startup or hook trust failed. Resolve the error and rerun start/activate-router. Runtime backup retained if present. ${error instanceof Error ? error.message : 'Unknown error.'}`);
     throw error;
   } finally {await fs.rm(staging, {recursive: true, force: true});}
 }
@@ -394,7 +423,8 @@ export async function setupMain() {
     case 'install': await withLock(p, async () => {
       const models = await install(p, Number(get('--port') ?? 47832));
       console.log(JSON.stringify({installed: true, models: models.map(m => ({id: m.id, name: m.displayName})),
-        next: 'Run setup.mjs activate-router to keep GPT and Claude together in the normal model picker. The claude profile remains available.'}, null, 2));
+        certificate: identityPaths(p.root).cert,
+        next: 'Configure CODEX_CA_CERTIFICATE for the Codex process, then run setup.mjs activate-router to keep GPT and Claude together in the normal model picker. The claude profile remains available.'}, null, 2));
     }); break;
     case 'activate': await withLock(p, () => activate(p, get('--model'))); console.log('Claude provider selected. Restart Codex to reload the model picker.'); break;
     case 'activate-router': await withLock(p, async () => {await activateRouter(p, get('--model')); await trustRouterStartup(p);}); await ensure(p); console.log('Combined GPT and Claude model picker enabled. Restart Codex to reload the catalog.'); break;
@@ -403,6 +433,7 @@ export async function setupMain() {
     case 'token': await ensure(p); process.stdout.write((await fs.readFile(p.token, 'utf8')).trim()); break;
     case 'start': await ensure(p); console.log('Claude bridge is running.'); break;
     case 'ensure-hook': if (await readText(p.state)) await ensure(p); break;
+    case 'certificate': console.log(identityPaths(p.root).cert); break;
     case 'stop': await stop(p); console.log('Claude bridge stopped.'); break;
     case 'doctor': {
       const state = await readState(p);
