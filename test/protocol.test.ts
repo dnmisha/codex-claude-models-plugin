@@ -120,3 +120,25 @@ test('named tool choice and unsupported structured-answer modes fail explicitly'
   assert.throws(() => preparePrompt({...request, text: {format: {type: 'json_schema', schema: {}}}}), /output-schema mode/);
   assert.throws(() => preparePrompt({...request, background: true}), /Background/);
 });
+
+test('structured decisions can complete after more than three internal SDK turns', async () => {
+  const model = {id: request.model, sdkModel: 'haiku', displayName: 'Haiku', description: '', efforts: []};
+  const fake = ((params: Parameters<typeof query>[0]) => Object.assign((async function* () {
+    if ((params.options?.maxTurns ?? 0) < 4) {
+      yield {type: 'result', subtype: 'error_max_turns', is_error: true} as SDKMessage;
+      return;
+    }
+    for (let n = 0; n < 3; n++) yield {type: 'assistant'} as SDKMessage;
+    yield {type: 'result', subtype: 'success', is_error: false, structured_output: {text: 'validated decision', calls: []}, modelUsage: {}} as SDKMessage;
+  })(), {close() {}, async accountInfo() {return {apiProvider: 'firstParty', subscriptionType: 'team'};}})) as unknown as typeof query;
+  const result = await sdkRunner('/tmp', [model], fake)({...request, tools: [], tool_choice: 'none'}, new AbortController().signal);
+  assert.equal(result.decision.text, 'validated decision');
+});
+
+test('SDK turn exhaustion is reported without suggesting credential failure', async () => {
+  const model = {id: request.model, sdkModel: 'haiku', displayName: 'Haiku', description: '', efforts: []};
+  const fake = (() => Object.assign((async function* () {
+    yield {type: 'result', subtype: 'error_max_turns', is_error: true} as SDKMessage;
+  })(), {close() {}, async accountInfo() {return {apiProvider: 'firstParty', subscriptionType: 'team'};}})) as unknown as typeof query;
+  await assert.rejects(sdkRunner('/tmp', [model], fake)(request, new AbortController().signal), (error: any) => error.code === 'sdk_turn_limit' && !error.message.includes('Check Claude login'));
+});

@@ -56,7 +56,8 @@ export function sdkRunner(cwd: string, models: ClaudeModel[], queryImpl: typeof 
     if (signal.aborted) abort();
     const effort = request.reasoning?.effort;
     const options: Options = {...isolatedOptions(cwd), model: model.sdkModel, systemPrompt: prepared.system,
-      abortController, maxTurns: 3, outputFormat: {type: 'json_schema', schema: outputSchemaFor(request)},
+      // Structured output may need internal schema-repair turns; these are not Codex tool executions.
+      abortController, maxTurns: 12, outputFormat: {type: 'json_schema', schema: outputSchemaFor(request)},
       ...(effort && model.efforts.includes(effort) ? {effort: effort as Options['effort']} : {})};
     let session: ReturnType<typeof query> | undefined;
     let release!: () => void;
@@ -75,6 +76,9 @@ export function sdkRunner(cwd: string, models: ClaudeModel[], queryImpl: typeof 
       permitted = true; release();
       for await (const message of session) {
         if (message.type !== 'result') continue;
+        if (message.subtype === 'error_max_turns') {
+          throw new BridgeError(502, 'sdk_turn_limit', 'Claude reached the internal structured-decision turn limit before producing a validated result. Retry a smaller step; the SDK did not report a login or network failure.');
+        }
         if (message.subtype !== 'success' || message.is_error) {
           throw new BridgeError(502, 'claude_failed', `Claude SDK did not complete successfully (${message.subtype}). Check Claude login, usage limits and model access.`);
         }

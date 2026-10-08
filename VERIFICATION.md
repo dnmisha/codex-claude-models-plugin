@@ -64,3 +64,12 @@ Reviewed call paths: catalog → setup → Codex model manager; setup → native
 Review corrections included the provider-routing architecture, v1 agent compatibility, OpenAI-header isolation, fixed destinations and redirect rejection, body/stream forwarding, literal tool-result handling, specific startup trust, canonical hook source paths and preservation of unrelated configuration.
 
 `deactivate` restores owned defaults and removes owned startup settings/trust. `uninstall` also preflights generated-file contents before deletion. Exact configuration backups and the private runtime remain available. This review does not audit the internals of Codex, Anthropic's executable, or all third-party dependencies.
+
+
+## October 8 follow-up: SDK decision budget
+
+A GUI task reported `error_max_turns` with the adapter's fixed three-turn SDK budget. Increased the bounded internal decision budget to 12, keeping the 180-second outer deadline, cancellation, subscription gate and disabled SDK execution tools. Exhaustion now reports `sdk_turn_limit` instead of generic login advice. No automatic whole-request retries are introduced.
+
+Validation: the new four-turn structured-result regression failed before the change and passed afterward; all 38 tests, TypeScript and build pass. The working router was updated with backup bundles retained. A real Sonnet High task on desktop backend 0.162.0-alpha.2 executed a Codex command to read a synthetic fixture and returned its exact content. An earlier live attempt completed with a tool-unavailable answer; model/tool-use reliability is not guaranteed by the increased budget.
+
+The desktop launcher uses a separate OS session via subprocess start_new_session=True to avoid sharing the Terminal controlling TTY. Session isolation was verified with a harmless child process; the next actual GUI launch is still a user action. The current GUI and app-server were confirmed to contain CODEX_CA_CERTIFICATE.
